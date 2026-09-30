@@ -48,6 +48,11 @@ class RandomizationStore:
                     role TEXT NOT NULL CHECK(role IN ('site','coordinator','monitor')),
                     site_id TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1))
                 );
+                CREATE TABLE IF NOT EXISTS sites(
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+                    created_at TEXT NOT NULL, deactivated_at TEXT
+                );
                 CREATE TABLE IF NOT EXISTS trials(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
                     protocol_version TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft'
@@ -90,6 +95,48 @@ class RandomizationStore:
                     first_approver TEXT REFERENCES users(id), second_approver TEXT REFERENCES users(id),
                     decided_at TEXT, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS number_segments(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trial_id INTEGER NOT NULL REFERENCES trials(id),
+                    site_id TEXT NOT NULL REFERENCES sites(id),
+                    stratum_key TEXT NOT NULL,
+                    start_no INTEGER NOT NULL, end_no INTEGER NOT NULL,
+                    total_count INTEGER NOT NULL,
+                    written_off_count INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','released')),
+                    note TEXT,
+                    created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,
+                    released_at TEXT, released_by TEXT
+                );
+                CREATE TABLE IF NOT EXISTS segment_numbers(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trial_id INTEGER NOT NULL REFERENCES trials(id),
+                    segment_id INTEGER REFERENCES number_segments(id),
+                    seq_no INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'available' CHECK(status IN ('available','reserved','written_off')),
+                    external_id TEXT, participant_id INTEGER REFERENCES participants(id),
+                    written_off_by TEXT REFERENCES users(id), written_off_at TEXT,
+                    UNIQUE(trial_id,seq_no)
+                );
+                CREATE TABLE IF NOT EXISTS upload_batches(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trial_id INTEGER NOT NULL REFERENCES trials(id),
+                    site_id TEXT NOT NULL REFERENCES sites(id),
+                    segment_id INTEGER REFERENCES number_segments(id),
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','completed','partial','failed')),
+                    total_count INTEGER NOT NULL, processed_count INTEGER NOT NULL DEFAULT 0,
+                    note TEXT, created_by TEXT NOT NULL REFERENCES users(id),
+                    created_at TEXT NOT NULL, updated_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS upload_items(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER NOT NULL REFERENCES upload_batches(id),
+                    external_id TEXT NOT NULL,
+                    factors_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','written_off','failed')),
+                    seq_no INTEGER, participant_id INTEGER REFERENCES participants(id),
+                    error TEXT, created_at TEXT NOT NULL, updated_at TEXT
+                );
                 CREATE TABLE IF NOT EXISTS audit_log(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, trial_id INTEGER REFERENCES trials(id),
                     actor_id TEXT NOT NULL REFERENCES users(id), action TEXT NOT NULL,
@@ -97,6 +144,16 @@ class RandomizationStore:
                 );
                 """
             )
+            self._migrate(conn)
+
+    def _migrate(self, conn):
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(participants)")}
+        if "segment_id" not in cols:
+            conn.execute("ALTER TABLE participants ADD COLUMN segment_id INTEGER REFERENCES number_segments(id)")
+        if "segment_number_id" not in cols:
+            conn.execute("ALTER TABLE participants ADD COLUMN segment_number_id INTEGER REFERENCES segment_numbers(id)")
+        if "source" not in cols:
+            conn.execute("ALTER TABLE participants ADD COLUMN source TEXT NOT NULL DEFAULT 'online' CHECK(source IN ('online','offline'))")
 
     def seed(self):
         self.init_schema()
@@ -111,6 +168,10 @@ class RandomizationStore:
                     ("monitor2", "独立监查员乙", "monitor", "CENTER"),
                 ],
             )
+            conn.executemany(
+                "INSERT OR IGNORE INTO sites(id,name,active,created_at) VALUES(?,?,1,?)",
+                [("S001", "中心一", now()), ("S002", "中心二", now())],
+            )
 
     def _user(self, conn, user_id, roles=None):
         if not user_id:
@@ -120,6 +181,10 @@ class RandomizationStore:
             raise BusinessError("用户不存在或已停用", 401, "unknown_user")
         if roles and user["role"] not in roles:
             raise BusinessError("当前角色无权执行此操作", 403, "forbidden")
+        if user["role"] == "site":
+            site = conn.execute("SELECT active FROM sites WHERE id=?", (user["site_id"],)).fetchone()
+            if site is not None and site["active"] == 0:
+                raise BusinessError("中心已停用", 403, "site_deactivated")
         return user
 
     def _trial(self, conn, trial_id):
@@ -388,10 +453,490 @@ class RandomizationStore:
             ).fetchall()
             audit = conn.execute("SELECT * FROM audit_log WHERE trial_id=? ORDER BY id", (trial_id,)).fetchall()
             return {
-                "trial": {"id": trial["id"], "name": trial["name"], "protocol_version": trial["protocol_version"], "status": trial["status"]},
+                "trial": {"id": trial["id"], "name": trial["name"], "protocol_version": trial["protocol_version"], "status": trial["status"],
+                          "arms": json.loads(trial["arms_json"]), "strata_factors": json.loads(trial["strata_factors_json"])},
                 "participants_visible": total, "by_site": [dict(x) for x in by_site],
                 "audit": [dict(x) | {"detail": json.loads(x["detail"])} for x in audit],
             }
+
+    # ---- 号段托管 ----
+
+    def _stratum_key(self, conn, trial, factors):
+        expected = json.loads(trial["strata_factors_json"])
+        if not isinstance(factors, dict) or set(factors) != set(expected):
+            raise BusinessError(f"必须提供分层因素: {', '.join(expected)}", 422, "invalid_factors")
+        normalized = {k: str(factors[k]).strip() for k in sorted(expected)}
+        if any(not v for v in normalized.values()):
+            raise BusinessError("分层因素值不能为空", 422, "invalid_factors")
+        return json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _stratum_for_segment(self, conn, trial, stratum_key):
+        row = conn.execute("SELECT * FROM strata WHERE trial_id=? AND stratum_key=?", (trial["id"], stratum_key)).fetchone()
+        if row:
+            return row
+        factors = json.loads(stratum_key)
+        cur = conn.execute(
+            "INSERT INTO strata(trial_id,stratum_key,factors_json,created_at) VALUES(?,?,?,?)",
+            (trial["id"], stratum_key, json.dumps(factors, ensure_ascii=False, sort_keys=True), now()),
+        )
+        return conn.execute("SELECT * FROM strata WHERE id=?", (cur.lastrowid,)).fetchone()
+
+    @staticmethod
+    def _find_free_run(blocked, count):
+        start = 1
+        while True:
+            if all((start + i) not in blocked for i in range(count)):
+                return start
+            start += 1
+
+    def create_segment(self, user_id, trial_id, site_id, factors, count, note=""):
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1 or count > 10000:
+            raise BusinessError("号段数量必须为 1-10000 的整数", 422, "invalid_count")
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._user(conn, user_id, {"coordinator"})
+                trial = self._trial(conn, trial_id)
+                if trial["status"] != "running":
+                    raise BusinessError("试验尚未开始或已停止", 409, "trial_not_running")
+                site = conn.execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone()
+                if not site or not site["active"]:
+                    raise BusinessError("中心不存在或已停用", 404, "site_not_found")
+                stratum_key = self._stratum_key(conn, trial, factors)
+                existing = conn.execute("SELECT seq_no, status FROM segment_numbers WHERE trial_id=?", (trial_id,)).fetchall()
+                blocked = {r["seq_no"] for r in existing if r["status"] in ("reserved", "written_off")}
+                start = self._find_free_run(blocked, count)
+                end = start + count - 1
+                cur = conn.execute(
+                    """INSERT INTO number_segments(trial_id,site_id,stratum_key,start_no,end_no,total_count,status,note,created_by,created_at)
+                       VALUES(?,?,?,?,?,?,'active',?,?,?)""",
+                    (trial_id, site_id, stratum_key, start, end, count, note.strip(), user_id, now()),
+                )
+                segment_id = cur.lastrowid
+                existing_seq = {r["seq_no"] for r in existing}
+                for seq_no in range(start, end + 1):
+                    if seq_no in existing_seq:
+                        conn.execute(
+                            "UPDATE segment_numbers SET segment_id=?, status='reserved' WHERE trial_id=? AND seq_no=? AND status='available'",
+                            (segment_id, trial_id, seq_no),
+                        )
+                    else:
+                        conn.execute(
+                            "INSERT INTO segment_numbers(trial_id,segment_id,seq_no,status) VALUES(?,?,?,'reserved')",
+                            (trial_id, segment_id, seq_no),
+                        )
+                self._audit(conn, trial_id, user_id, "segment.create", {
+                    "segment_id": segment_id, "site_id": site_id, "stratum_key": stratum_key,
+                    "start_no": start, "end_no": end, "count": count,
+                })
+                conn.commit()
+                return self._segment_with_counts(conn, segment_id)
+            except Exception:
+                conn.rollback()
+                raise
+
+    def _segment_with_counts(self, conn, segment_id):
+        seg = conn.execute("SELECT * FROM number_segments WHERE id=?", (segment_id,)).fetchone()
+        if not seg:
+            raise BusinessError("号段不存在", 404, "not_found")
+        counts = conn.execute(
+            "SELECT status, COUNT(*) c FROM segment_numbers WHERE segment_id=? GROUP BY status", (segment_id,)
+        ).fetchall()
+        by_status = {r["status"]: r["c"] for r in counts}
+        d = dict(seg)
+        d["written_off_count"] = by_status.get("written_off", 0)
+        d["unused_count"] = by_status.get("reserved", 0)
+        d["released_count"] = by_status.get("available", 0)
+        return d
+
+    def list_segments(self, user_id, trial_id):
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
+            self._trial(conn, trial_id)
+            if actor["role"] == "site":
+                rows = conn.execute(
+                    "SELECT * FROM number_segments WHERE trial_id=? AND site_id=? ORDER BY id", (trial_id, actor["site_id"])
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM number_segments WHERE trial_id=? ORDER BY id", (trial_id,)).fetchall()
+            return [self._segment_with_counts(conn, r["id"]) for r in rows]
+
+    def get_segment(self, user_id, segment_id):
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
+            seg = conn.execute("SELECT * FROM number_segments WHERE id=?", (segment_id,)).fetchone()
+            if not seg:
+                raise BusinessError("号段不存在", 404, "not_found")
+            if actor["role"] == "site" and seg["site_id"] != actor["site_id"]:
+                raise BusinessError("只能查看本中心号段", 403, "site_isolation")
+            numbers = conn.execute(
+                "SELECT seq_no,status,external_id,participant_id,written_off_at FROM segment_numbers WHERE segment_id=? ORDER BY seq_no",
+                (segment_id,),
+            ).fetchall()
+            d = self._segment_with_counts(conn, segment_id)
+            d["numbers"] = [dict(n) for n in numbers]
+            return d
+
+    def _create_offline_participant(self, conn, trial, actor, external_id, factors, number):
+        stratum = self._stratum_for_segment(conn, trial, self._stratum_key(conn, trial, factors))
+        seq_no = number["seq_no"]
+        arms = json.loads(trial["arms_json"])
+        arm = arms[(seq_no - 1) % len(arms)]
+        allocation_code = f"{seq_no:06d}"
+        cur = conn.execute(
+            "INSERT INTO allocations(trial_id,stratum_id,sequence,block_no,arm,used_by,used_at) VALUES(?,?,?,?,?,?,?)",
+            (trial["id"], stratum["id"], seq_no, 0, arm, None, now()),
+        )
+        allocation_id = cur.lastrowid
+        cur = conn.execute(
+            """INSERT INTO participants(trial_id,site_id,external_id,stratum_id,allocation_id,allocation_code,enrolled_by,created_at,source,segment_id,segment_number_id)
+               VALUES(?,?,?,?,?,?,?,?,'offline',?,?)""",
+            (trial["id"], actor["site_id"], external_id, stratum["id"], allocation_id, allocation_code,
+             actor["id"], now(), number["segment_id"], number["id"]),
+        )
+        participant_id = cur.lastrowid
+        conn.execute("UPDATE allocations SET used_by=? WHERE id=?", (participant_id, allocation_id))
+        return conn.execute("SELECT * FROM participants WHERE id=?", (participant_id,)).fetchone()
+
+    def write_off_number(self, user_id, segment_id, external_id, factors):
+        external_id = str(external_id).strip()
+        if not external_id:
+            raise BusinessError("外部受试者编号不能为空", 422, "invalid_external_id")
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                actor = self._user(conn, user_id, {"site"})
+                seg = conn.execute("SELECT * FROM number_segments WHERE id=?", (segment_id,)).fetchone()
+                if not seg:
+                    raise BusinessError("号段不存在", 404, "not_found")
+                if seg["site_id"] != actor["site_id"]:
+                    raise BusinessError("只能核销本中心号段", 403, "site_isolation")
+                if seg["status"] != "active":
+                    raise BusinessError("号段已释放，不能核销", 409, "segment_released")
+                trial = self._trial(conn, seg["trial_id"])
+                if trial["status"] != "running":
+                    raise BusinessError("试验尚未开始或已停止", 409, "trial_not_running")
+                stratum_key = self._stratum_key(conn, trial, factors)
+                if stratum_key != seg["stratum_key"]:
+                    raise BusinessError("分层因素与号段不匹配", 422, "stratum_mismatch")
+                existing = conn.execute(
+                    "SELECT * FROM participants WHERE trial_id=? AND external_id=?", (trial["id"], external_id)
+                ).fetchone()
+                if existing:
+                    if existing["site_id"] != actor["site_id"]:
+                        raise BusinessError("不能核销其他中心的受试者", 403, "site_isolation")
+                    conn.commit()
+                    return self._blinded_participant(conn, existing, actor, allow_arm=False, idempotent=True)
+                number = conn.execute(
+                    "SELECT * FROM segment_numbers WHERE segment_id=? AND status='reserved' ORDER BY seq_no LIMIT 1",
+                    (segment_id,),
+                ).fetchone()
+                if not number:
+                    raise BusinessError("号段已无可用名额，请联系协调员补领", 409, "no_number_available")
+                participant = self._create_offline_participant(conn, trial, actor, external_id, factors, number)
+                conn.execute(
+                    "UPDATE segment_numbers SET status='written_off', external_id=?, participant_id=?, written_off_by=?, written_off_at=? WHERE id=?",
+                    (external_id, participant["id"], user_id, now(), number["id"]),
+                )
+                conn.execute("UPDATE number_segments SET written_off_count=written_off_count+1 WHERE id=?", (segment_id,))
+                self._audit(conn, trial["id"], user_id, "segment.write_off", {
+                    "segment_id": segment_id, "seq_no": number["seq_no"],
+                    "external_id": external_id, "participant_id": participant["id"],
+                })
+                conn.commit()
+                return self._blinded_participant(conn, participant, actor, allow_arm=False, idempotent=False)
+            except Exception:
+                conn.rollback()
+                raise
+
+    def release_segment(self, user_id, segment_id, confirm=False):
+        if not confirm:
+            raise BusinessError("请确认释放未用号段", 422, "confirm_required")
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._user(conn, user_id, {"coordinator"})
+                seg = conn.execute("SELECT * FROM number_segments WHERE id=?", (segment_id,)).fetchone()
+                if not seg:
+                    raise BusinessError("号段不存在", 404, "not_found")
+                if seg["status"] != "active":
+                    raise BusinessError("号段已释放", 409, "already_released")
+                released = conn.execute(
+                    "UPDATE segment_numbers SET status='available' WHERE segment_id=? AND status='reserved'",
+                    (segment_id,),
+                ).rowcount
+                conn.execute(
+                    "UPDATE number_segments SET status='released', released_at=?, released_by=? WHERE id=?",
+                    (now(), user_id, segment_id),
+                )
+                self._audit(conn, seg["trial_id"], user_id, "segment.release", {
+                    "segment_id": segment_id, "released_count": released,
+                })
+                conn.commit()
+                return self._segment_with_counts(conn, segment_id)
+            except Exception:
+                conn.rollback()
+                raise
+
+    def deactivate_site(self, user_id, site_id):
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._user(conn, user_id, {"coordinator"})
+                site = conn.execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone()
+                if not site:
+                    raise BusinessError("中心不存在", 404, "not_found")
+                if not site["active"]:
+                    raise BusinessError("中心已停用", 409, "already_deactivated")
+                conn.execute("UPDATE sites SET active=0, deactivated_at=? WHERE id=?", (now(), site_id))
+                segments = conn.execute(
+                    "SELECT id FROM number_segments WHERE site_id=? AND status='active'", (site_id,)
+                ).fetchall()
+                released_total = 0
+                for s in segments:
+                    released_total += conn.execute(
+                        "UPDATE segment_numbers SET status='available' WHERE segment_id=? AND status='reserved'",
+                        (s["id"],),
+                    ).rowcount
+                    conn.execute(
+                        "UPDATE number_segments SET status='released', released_at=?, released_by=? WHERE id=?",
+                        (now(), user_id, s["id"]),
+                    )
+                self._audit(conn, None, user_id, "site.deactivate", {"site_id": site_id, "released_numbers": released_total})
+                conn.commit()
+                return {"site_id": site_id, "active": False, "released_numbers": released_total}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def activate_site(self, user_id, site_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"coordinator"})
+            site = conn.execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone()
+            if not site:
+                raise BusinessError("中心不存在", 404, "not_found")
+            if site["active"]:
+                raise BusinessError("中心已启用", 409, "already_active")
+            conn.execute("UPDATE sites SET active=1, deactivated_at=NULL WHERE id=?", (site_id,))
+            self._audit(conn, None, user_id, "site.activate", {"site_id": site_id})
+            return {"site_id": site_id, "active": True}
+
+    def list_sites(self, user_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"coordinator", "monitor"})
+            rows = conn.execute("SELECT * FROM sites ORDER BY id").fetchall()
+            return [dict(r) for r in rows]
+
+    # ---- 上传批次（离线核销清单）----
+
+    def create_upload_batch(self, user_id, trial_id, items, segment_id=None, note=""):
+        if not isinstance(items, list) or not items:
+            raise BusinessError("请提供核销清单", 422, "invalid_items")
+        cleaned, seen = [], set()
+        for it in items:
+            if not isinstance(it, dict):
+                raise BusinessError("清单项格式错误", 422, "invalid_items")
+            ext = str(it.get("external_id", "")).strip()
+            if not ext:
+                raise BusinessError("外部受试者编号不能为空", 422, "invalid_external_id")
+            if ext in seen:
+                raise BusinessError(f"清单内外部编号重复: {ext}", 422, "duplicate_external_id")
+            seen.add(ext)
+            factors = it.get("factors", {})
+            if not isinstance(factors, dict):
+                raise BusinessError("分层因素格式错误", 422, "invalid_factors")
+            cleaned.append({"external_id": ext, "factors": factors})
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                actor = self._user(conn, user_id, {"site"})
+                trial = self._trial(conn, trial_id)
+                if trial["status"] != "running":
+                    raise BusinessError("试验尚未开始或已停止", 409, "trial_not_running")
+                if segment_id is not None:
+                    seg = conn.execute("SELECT * FROM number_segments WHERE id=?", (segment_id,)).fetchone()
+                    if not seg or seg["site_id"] != actor["site_id"] or seg["status"] != "active":
+                        raise BusinessError("号段不存在、不属于本中心或已释放", 404, "segment_not_found")
+                cur = conn.execute(
+                    """INSERT INTO upload_batches(trial_id,site_id,segment_id,status,total_count,note,created_by,created_at,updated_at)
+                       VALUES(?,?,?,'pending',?,?,?,?,?)""",
+                    (trial_id, actor["site_id"], segment_id, len(cleaned), note.strip(), user_id, now(), now()),
+                )
+                batch_id = cur.lastrowid
+                for it in cleaned:
+                    conn.execute(
+                        "INSERT INTO upload_items(batch_id,external_id,factors_json,status,created_at,updated_at) VALUES(?,?,?,'pending',?,?)",
+                        (batch_id, it["external_id"], json.dumps(it["factors"], ensure_ascii=False, sort_keys=True), now(), now()),
+                    )
+                self._audit(conn, trial_id, user_id, "upload_batch.create", {
+                    "batch_id": batch_id, "total": len(cleaned), "segment_id": segment_id,
+                })
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return self.process_upload_batch(user_id, batch_id)
+
+    def _find_segment_for_writeoff(self, conn, trial, site_id, stratum_key, segment_id):
+        if segment_id is not None:
+            seg = conn.execute("SELECT * FROM number_segments WHERE id=?", (segment_id,)).fetchone()
+            if (seg and seg["site_id"] == site_id and seg["status"] == "active"
+                    and seg["stratum_key"] == stratum_key):
+                has = conn.execute(
+                    "SELECT 1 FROM segment_numbers WHERE segment_id=? AND status='reserved' LIMIT 1",
+                    (seg["id"],),
+                ).fetchone()
+                if has:
+                    return seg
+        seg = conn.execute(
+            """SELECT s.* FROM number_segments s
+               WHERE s.trial_id=? AND s.site_id=? AND s.stratum_key=? AND s.status='active'
+                 AND EXISTS (SELECT 1 FROM segment_numbers n WHERE n.segment_id=s.id AND n.status='reserved')
+               ORDER BY s.id LIMIT 1""",
+            (trial["id"], site_id, stratum_key),
+        ).fetchone()
+        if not seg:
+            raise BusinessError("无可用号段，请联系协调员预领", 409, "no_segment_available")
+        return seg
+
+    def _write_off_for_item(self, conn, trial, actor, batch, item):
+        external_id = item["external_id"]
+        factors = json.loads(item["factors_json"])
+        existing = conn.execute(
+            "SELECT * FROM participants WHERE trial_id=? AND external_id=?", (trial["id"], external_id)
+        ).fetchone()
+        if existing:
+            if existing["site_id"] != actor["site_id"]:
+                raise BusinessError("外部编号已被其他中心使用", 409, "external_id_conflict")
+            return existing
+        stratum_key = self._stratum_key(conn, trial, factors)
+        seg = self._find_segment_for_writeoff(conn, trial, actor["site_id"], stratum_key, batch["segment_id"])
+        number = conn.execute(
+            "SELECT * FROM segment_numbers WHERE segment_id=? AND status='reserved' ORDER BY seq_no LIMIT 1",
+            (seg["id"],),
+        ).fetchone()
+        if not number:
+            raise BusinessError("号段已无可用名额", 409, "no_number_available")
+        participant = self._create_offline_participant(conn, trial, actor, external_id, factors, number)
+        conn.execute(
+            "UPDATE segment_numbers SET status='written_off', external_id=?, participant_id=?, written_off_by=?, written_off_at=? WHERE id=?",
+            (external_id, participant["id"], actor["id"], now(), number["id"]),
+        )
+        conn.execute("UPDATE number_segments SET written_off_count=written_off_count+1 WHERE id=?", (seg["id"],))
+        return participant
+
+    def process_upload_batch(self, user_id, batch_id):
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                actor = self._user(conn, user_id, {"site"})
+                batch = conn.execute("SELECT * FROM upload_batches WHERE id=?", (batch_id,)).fetchone()
+                if not batch:
+                    raise BusinessError("上传批次不存在", 404, "not_found")
+                if batch["site_id"] != actor["site_id"]:
+                    raise BusinessError("只能处理本中心批次", 403, "site_isolation")
+                if batch["status"] == "completed":
+                    conn.commit()
+                    return self._batch_with_items(conn, batch_id)
+                conn.execute("UPDATE upload_batches SET status='processing', updated_at=? WHERE id=?", (now(), batch_id))
+                trial = self._trial(conn, batch["trial_id"])
+                items = conn.execute(
+                    "SELECT * FROM upload_items WHERE batch_id=? AND status IN ('pending','failed') ORDER BY id", (batch_id,)
+                ).fetchall()
+                for item in items:
+                    try:
+                        participant = self._write_off_for_item(conn, trial, actor, batch, item)
+                        conn.execute(
+                            "UPDATE upload_items SET status='written_off', participant_id=?, updated_at=? WHERE id=?",
+                            (participant["id"], now(), item["id"]),
+                        )
+                    except BusinessError as exc:
+                        conn.execute(
+                            "UPDATE upload_items SET status='failed', error=?, updated_at=? WHERE id=?",
+                            (exc.message, now(), item["id"]),
+                        )
+                total_written = conn.execute(
+                    "SELECT COUNT(*) FROM upload_items WHERE batch_id=? AND status='written_off'", (batch_id,)
+                ).fetchone()[0]
+                total_failed = conn.execute(
+                    "SELECT COUNT(*) FROM upload_items WHERE batch_id=? AND status='failed'", (batch_id,)
+                ).fetchone()[0]
+                conn.execute("UPDATE upload_batches SET processed_count=?, updated_at=? WHERE id=?", (total_written, now(), batch_id))
+                if total_failed == 0:
+                    conn.execute("UPDATE upload_batches SET status='completed' WHERE id=?", (batch_id,))
+                elif total_written == 0:
+                    conn.execute("UPDATE upload_batches SET status='failed' WHERE id=?", (batch_id,))
+                else:
+                    conn.execute("UPDATE upload_batches SET status='partial' WHERE id=?", (batch_id,))
+                self._audit(conn, batch["trial_id"], user_id, "upload_batch.process", {
+                    "batch_id": batch_id, "written": total_written, "failed": total_failed,
+                })
+                conn.commit()
+                return self._batch_with_items(conn, batch_id)
+            except Exception:
+                conn.rollback()
+                raise
+
+    def _batch_with_items(self, conn, batch_id):
+        batch = conn.execute("SELECT * FROM upload_batches WHERE id=?", (batch_id,)).fetchone()
+        if not batch:
+            raise BusinessError("上传批次不存在", 404, "not_found")
+        items = conn.execute(
+            "SELECT id,external_id,status,participant_id,error,created_at,updated_at FROM upload_items WHERE batch_id=? ORDER BY id",
+            (batch_id,),
+        ).fetchall()
+        d = dict(batch)
+        d["items"] = [dict(it) for it in items]
+        return d
+
+    def list_upload_batches(self, user_id, trial_id):
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
+            self._trial(conn, trial_id)
+            if actor["role"] == "site":
+                rows = conn.execute(
+                    "SELECT * FROM upload_batches WHERE trial_id=? AND site_id=? ORDER BY id DESC", (trial_id, actor["site_id"])
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM upload_batches WHERE trial_id=? ORDER BY id DESC", (trial_id,)).fetchall()
+            return [self._batch_with_items(conn, r["id"]) for r in rows]
+
+    def get_upload_batch(self, user_id, batch_id):
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
+            batch = conn.execute("SELECT * FROM upload_batches WHERE id=?", (batch_id,)).fetchone()
+            if not batch:
+                raise BusinessError("上传批次不存在", 404, "not_found")
+            if actor["role"] == "site" and batch["site_id"] != actor["site_id"]:
+                raise BusinessError("只能查看本中心批次", 403, "site_isolation")
+            return self._batch_with_items(conn, batch_id)
+
+    def resume_pending_batches(self):
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id,created_by FROM upload_batches WHERE status IN ('pending','partial') ORDER BY id"
+            ).fetchall()
+        for r in rows:
+            try:
+                self.process_upload_batch(r["created_by"], r["id"])
+            except Exception as exc:
+                print(f"恢复批次 {r['id']} 失败: {exc}")
+
+    def list_audit(self, user_id, trial_id):
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
+            self._trial(conn, trial_id)
+            if actor["role"] == "site":
+                rows = conn.execute(
+                    """SELECT a.* FROM audit_log a JOIN users u ON u.id=a.actor_id
+                       WHERE a.trial_id=? AND u.site_id=? ORDER BY a.id""",
+                    (trial_id, actor["site_id"]),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM audit_log WHERE trial_id=? OR trial_id IS NULL ORDER BY id", (trial_id,)
+                ).fetchall()
+            return [dict(r) | {"detail": json.loads(r["detail"])} for r in rows]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -431,6 +976,33 @@ class Handler(BaseHTTPRequestHandler):
             d=self._body(); return self._send(201, store.request_unblinding(user,int(parts[2]),d.get("reason","")))
         if len(parts)==4 and parts[:2]==["api","unblinding-requests"] and parts[3]=="approve" and method=="POST":
             return self._send(200, store.approve_unblinding(user,int(parts[2])))
+        # 号段托管
+        if len(parts)==4 and parts[:2]==["api","trials"] and parts[3]=="segments" and method=="POST":
+            d=self._body(); return self._send(201, store.create_segment(user,trial_id,d.get("site_id",""),d.get("factors",{}),d.get("count"),d.get("note","")))
+        if len(parts)==4 and parts[:2]==["api","trials"] and parts[3]=="segments" and method=="GET":
+            return self._send(200, {"items": store.list_segments(user,trial_id)})
+        if len(parts)==3 and parts[:2]==["api","segments"] and method=="GET":
+            return self._send(200, store.get_segment(user,int(parts[2])))
+        if len(parts)==4 and parts[:2]==["api","segments"] and parts[3]=="write-off" and method=="POST":
+            d=self._body(); return self._send(201, store.write_off_number(user,int(parts[2]),d.get("external_id",""),d.get("factors",{})))
+        if len(parts)==4 and parts[:2]==["api","segments"] and parts[3]=="release" and method=="POST":
+            d=self._body(); return self._send(200, store.release_segment(user,int(parts[2]),bool(d.get("confirm"))))
+        if len(parts)==4 and parts[:2]==["api","trials"] and parts[3]=="upload-batches" and method=="POST":
+            d=self._body(); return self._send(201, store.create_upload_batch(user,trial_id,d.get("items",[]),d.get("segment_id"),d.get("note","")))
+        if len(parts)==4 and parts[:2]==["api","trials"] and parts[3]=="upload-batches" and method=="GET":
+            return self._send(200, {"items": store.list_upload_batches(user,trial_id)})
+        if len(parts)==3 and parts[:2]==["api","upload-batches"] and method=="GET":
+            return self._send(200, store.get_upload_batch(user,int(parts[2])))
+        if len(parts)==4 and parts[:2]==["api","upload-batches"] and parts[3]=="process" and method=="POST":
+            return self._send(200, store.process_upload_batch(user,int(parts[2])))
+        if len(parts)==4 and parts[:2]==["api","trials"] and parts[3]=="audit" and method=="GET":
+            return self._send(200, {"items": store.list_audit(user,trial_id)})
+        if len(parts)==2 and parts==["api","sites"] and method=="GET":
+            return self._send(200, {"items": store.list_sites(user)})
+        if len(parts)==4 and parts[:2]==["api","sites"] and parts[3]=="deactivate" and method=="POST":
+            return self._send(200, store.deactivate_site(user,parts[2]))
+        if len(parts)==4 and parts[:2]==["api","sites"] and parts[3]=="activate" and method=="POST":
+            return self._send(200, store.activate_site(user,parts[2]))
         raise BusinessError("接口不存在",404,"not_found")
     def _handle(self, method):
         try: self._dispatch(method)
@@ -455,6 +1027,7 @@ def main():
     if args.seed: store.seed()
     if args.init or args.seed: print(f"数据库已初始化: {args.db}"); return
     server=RandomizationServer(("127.0.0.1",args.port),store); print(f"随机化服务运行于 http://127.0.0.1:{args.port}")
+    threading.Thread(target=store.resume_pending_batches, daemon=True).start()
     try: server.serve_forever()
     except KeyboardInterrupt: pass
     finally: server.server_close()
