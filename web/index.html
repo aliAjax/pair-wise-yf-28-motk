@@ -1,4 +1,159 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>临床试验随机化</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>临床试验随机分配与盲法</h1><div class="panel"><select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select><input id="trial" value="1"><button onclick="load()">查看试验摘要</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/trials/${trial.value}/summary`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>补号段托管 · 随机化服务</title>
+<style>
+body{font:15px system-ui;max-width:1080px;margin:24px auto;padding:0 16px;color:#222}
+h1{font-size:22px}h2{font-size:17px;margin:20px 0 8px}
+.panel{border:1px solid #bbb;border-radius:8px;padding:14px;margin:12px 0}
+select,input,button,textarea{font:inherit;padding:6px 8px;margin:3px;box-sizing:border-box}
+input[type=number]{width:90px}textarea{width:100%;height:90px;font-family:ui-monospace,monospace;font-size:13px}
+button{cursor:pointer;border-radius:5px;border:1px solid #88a;background:#eef}
+button.warn{background:#fdd;border-color:#c88}
+button.good{background:#dfd;border-color:#8a8}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{border:1px solid #ccc;padding:4px 7px;text-align:left}
+th{background:#f3f3f3}
+.pill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px}
+.pill.used{background:#dfd}.pill.reserved{background:#eef}.pill.released{background:#eee;color:#777}
+.pill.failed{background:#fdd}.pill.reconciled{background:#dfd}.pill.pending{background:#ffd}
+pre{background:#f5f5f5;padding:10px;white-space:pre-wrap;border-radius:6px;font-size:13px;max-height:340px;overflow:auto}
+.row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.muted{color:#888;font-size:12px}
+</style>
+</head>
+<body>
+<h1>补号段托管 · 离线入组核销</h1>
+<div class="panel row">
+  <label>用户
+    <select id="user">
+      <option value="coord">coord（协调员）</option>
+      <option value="site1">site1（中心一 S001）</option>
+      <option value="site2">site2（中心二 S002）</option>
+      <option value="monitor1">monitor1（监查员）</option>
+    </select>
+  </label>
+  <label>试验 <input id="trial" type="number" value="1" style="width:70px"></label>
+  <button onclick="loadSegments()">刷新号段列表</button>
+  <button onclick="loadSummary()">查看试验摘要</button>
+  <span class="muted">先创建并 start 试验，再按中心/分层预占号段</span>
+</div>
+
+<div class="panel">
+  <h2>① 预占号段（协调员）</h2>
+  <div class="row">
+    <label>中心 <input id="segSite" value="S001" style="width:90px"></label>
+    <label>分层 JSON <input id="segFactors" value='{"risk":"low"}' style="width:200px"></label>
+    <label>连续号数量 <input id="segCount" type="number" value="6" min="1" max="200"></label>
+    <button class="good" onclick="reserve()">发起号段</button>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <button class="warn" onclick="toggleSite('S001',false)">停用 S001</button>
+    <button class="good" onclick="toggleSite('S001',true)">启用 S001</button>
+    <button class="warn" onclick="toggleSite('S002',false)">停用 S002</button>
+    <button class="good" onclick="toggleSite('S002',true)">启用 S002</button>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>② 号段列表</h2>
+  <div id="segments" class="muted">点击“刷新号段列表”。</div>
+</div>
+
+<div class="panel">
+  <h2>③ 离线核销 / 差异</h2>
+  <div class="row">
+    <label>号段 <input id="segId" type="number" style="width:80px"></label>
+    <button onclick="showSegment()">查看号段与差异</button>
+  </div>
+  <p class="muted">离线清单 JSON，例如：<code>[{"external_id":"P-001","sequence":1}]</code>。同一外部编号只核销一次；失败项保留原号段并可重试。</p>
+  <textarea id="items" placeholder='[{"external_id":"P-001","sequence":1}]'></textarea>
+  <div class="row">
+    <button class="good" onclick="uploadItems()">上传核销</button>
+    <button onclick="retry()">重试未核销清单</button>
+    <button class="warn" onclick="release()">确认释放少用名额</button>
+  </div>
+  <div id="detail"></div>
+</div>
+
+<h2>最近响应 / 审计</h2>
+<pre id="out">（操作结果显示在这里）</pre>
+
+<script>
+const $ = id => document.getElementById(id);
+async function api(path, opts={}){
+  const r = await fetch(path, Object.assign({headers:{"X-User-Id":$("user").value,"Content-Type":"application/json"}}, opts));
+  const data = await r.json();
+  $("out").textContent = JSON.stringify(data, null, 2);
+  if(!r.ok) throw new Error(data.error?.message || "请求失败");
+  return data;
+}
+function factorsInput(){
+  try { return JSON.parse($("segFactors").value); }
+  catch { alert("分层 JSON 格式错误"); throw new Error("bad json"); }
+}
+async function reserve(){
+  const body = {site_id:$("segSite").value.trim(), factors:factorsInput(), count:Number($("segCount").value)};
+  await api(`/api/trials/${$("trial").value}/segments`, {method:"POST", body:JSON.stringify(body)});
+  loadSegments();
+}
+async function toggleSite(id, active){
+  await api(`/api/sites/${id}`, {method:"POST", body:JSON.stringify({active})});
+  loadSegments();
+}
+function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+function pill(s){return `<span class="pill ${s}">${s}</span>`;}
+async function loadSegments(){
+  const data = await api(`/api/trials/${$("trial").value}/segments`);
+  if(!data.items.length){ $("segments").innerHTML = '<span class="muted">暂无号段</span>'; return; }
+  $("segments").innerHTML = `<table><tr>
+    <th>ID</th><th>中心</th><th>分层</th><th>连续号段</th><th>状态</th>
+    <th>已用/预留/释放</th><th>待传/已核销/失败</th><th>操作</th></tr>
+    ${data.items.map(s=>`<tr>
+      <td>${s.id}</td><td>${esc(s.site_id)}</td><td>${esc(s.stratum_key)}</td>
+      <td>${s.seq_start}–${s.seq_end}</td><td>${pill(s.status)}</td>
+      <td>${s.counts.used} / ${s.counts.reserved} / ${s.counts.released}</td>
+      <td>${s.uploads.pending} / ${s.uploads.reconciled} / ${s.uploads.failed}</td>
+      <td><button onclick="$('segId').value=${s.id};showSegment()">查看/核销</button></td>
+    </tr>`).join("")}</table>`;
+}
+async function showSegment(){
+  const d = await api(`/api/segments/${$("segId").value}`);
+  renderDetail(d);
+}
+function renderDetail(d){
+  const rows = d.diff.items.map(x=>`<tr>
+    <td>${esc(x.sequence)}</td><td>${esc(x.external_id)}</td>
+    <td>${x.arm ?? "—"}</td>
+    <td>${x.state ? pill(x.state) : "—"}</td>
+    <td>${x.upload_status ? pill(x.upload_status) : "—"}</td>
+    <td>${x.kind}</td><td class="muted">${esc(x.error)}</td></tr>`).join("");
+  $("detail").innerHTML = `
+    <p>号段 <b>${d.seq_start}–${d.seq_end}</b>（${esc(d.site_id)} / ${esc(d.stratum_key)}，${pill(d.status)}）</p>
+    <p>差异：已核销 <b>${d.diff.reconciled}</b>，未核销 <b>${d.diff.unreconciled}</b>，
+       未用 <b>${d.diff.unused}</b>，已释放 <b>${d.diff.released}</b></p>
+    <table><tr><th>序号</th><th>外部编号</th><th>分组(盲)</th><th>号码状态</th><th>上传状态</th><th>差异分类</th><th>错误</th></tr>${rows}</table>`;
+}
+async function uploadItems(){
+  let items;
+  try { items = JSON.parse($("items").value); }
+  catch { alert("清单必须是 JSON 数组"); return; }
+  const d = await api(`/api/trials/${$("trial").value}/segments/${$("segId").value}/offline-items`,
+    {method:"POST", body:JSON.stringify({items})});
+  renderDetail(d.segment);
+}
+async function retry(){
+  const d = await api(`/api/segments/${$("segId").value}/retry`, {method:"POST"});
+  renderDetail(d.segment);
+}
+async function release(){
+  if(!confirm("确认释放号段内未使用名额？已核销编号不会回收。")) return;
+  await api(`/api/segments/${$("segId").value}/release`, {method:"POST"});
+  showSegment(); loadSegments();
+}
+async function loadSummary(){ await api(`/api/trials/${$("trial").value}/summary`); }
+</script>
+</body>
+</html>
